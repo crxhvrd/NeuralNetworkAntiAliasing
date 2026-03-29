@@ -701,16 +701,251 @@ class ConvertTab(tk.Frame):
 # Tab: Test
 # ============================================================================
 
+class SyncZoomViewer:
+    """
+    Synchronized zoom/pan controller for two canvases displaying paired images.
+    
+    Controls:
+      - Scroll wheel: zoom in/out (1× to 32×)
+      - Click + drag: pan
+      - Double-click: reset to fit view
+    
+    Both canvases always show the same region of the image at the same zoom level.
+    """
+
+    ZOOM_LEVELS = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0]
+
+    def __init__(self, canvas_a, canvas_b, status_label=None):
+        self.canvas_a = canvas_a
+        self.canvas_b = canvas_b
+        self.status_label = status_label
+
+        self.img_a = None  # PIL Image (original)
+        self.img_b = None  # PIL Image (result)
+        self.photo_a = None  # keep reference to prevent GC
+        self.photo_b = None
+
+        # Viewport state (in image pixel coordinates)
+        self._zoom_idx = None   # index into ZOOM_LEVELS, None = fit mode
+        self._center_x = 0.0   # center of viewport in image coords
+        self._center_y = 0.0
+        self._drag_start = None
+
+        # Bind events on both canvases
+        for canvas in (canvas_a, canvas_b):
+            canvas.bind('<MouseWheel>', self._on_scroll)
+            canvas.bind('<Button-4>', self._on_scroll)   # Linux scroll up
+            canvas.bind('<Button-5>', self._on_scroll)   # Linux scroll down
+            canvas.bind('<ButtonPress-1>', self._on_drag_start)
+            canvas.bind('<B1-Motion>', self._on_drag)
+            canvas.bind('<ButtonRelease-1>', self._on_drag_end)
+            canvas.bind('<Double-Button-1>', self._on_reset)
+            canvas.bind('<Configure>', lambda e: self._redraw())
+
+    def set_images(self, pil_a, pil_b):
+        """Set new image pair and reset to fit view."""
+        self.img_a = pil_a
+        self.img_b = pil_b
+        self._zoom_idx = None
+        if pil_a:
+            iw, ih = pil_a.size
+            self._center_x = iw / 2
+            self._center_y = ih / 2
+        self._redraw()
+
+    def _get_zoom(self):
+        """Return current zoom factor. None = fit-to-canvas."""
+        if self._zoom_idx is None:
+            return None
+        return self.ZOOM_LEVELS[self._zoom_idx]
+
+    def _fit_zoom(self, canvas):
+        """Calculate the zoom factor that fits the image to the canvas."""
+        if not self.img_a:
+            return 1.0
+        canvas.update_idletasks()
+        cw = max(canvas.winfo_width(), 50)
+        ch = max(canvas.winfo_height(), 50)
+        iw, ih = self.img_a.size
+        return min(cw / iw, ch / ih)
+
+    def _on_scroll(self, event):
+        if not self.img_a:
+            return
+
+        # Determine scroll direction
+        if event.num == 5 or (hasattr(event, 'delta') and event.delta < 0):
+            direction = -1  # zoom out
+        else:
+            direction = 1   # zoom in
+
+        # If currently in fit mode, find the nearest zoom level
+        if self._zoom_idx is None:
+            fit_z = self._fit_zoom(self.canvas_a)
+            self._zoom_idx = 0
+            for i, z in enumerate(self.ZOOM_LEVELS):
+                if z <= fit_z:
+                    self._zoom_idx = i
+                else:
+                    break
+
+        # Find the image coordinate under the mouse cursor BEFORE zoom
+        canvas = event.widget
+        canvas.update_idletasks()
+        cw = canvas.winfo_width()
+        ch = canvas.winfo_height()
+        old_zoom = self.ZOOM_LEVELS[self._zoom_idx]
+
+        # Mouse position relative to canvas center
+        mx = event.x - cw / 2
+        my = event.y - ch / 2
+
+        # Image coordinate under cursor
+        img_x = self._center_x + mx / old_zoom
+        img_y = self._center_y + my / old_zoom
+
+        # Apply zoom step
+        new_idx = self._zoom_idx + direction
+        new_idx = max(0, min(len(self.ZOOM_LEVELS) - 1, new_idx))
+        self._zoom_idx = new_idx
+        new_zoom = self.ZOOM_LEVELS[new_idx]
+
+        # Adjust center so the same image point stays under the cursor
+        self._center_x = img_x - mx / new_zoom
+        self._center_y = img_y - my / new_zoom
+
+        self._clamp_center(new_zoom)
+        self._redraw()
+
+    def _on_drag_start(self, event):
+        self._drag_start = (event.x, event.y)
+
+    def _on_drag(self, event):
+        if self._drag_start is None or not self.img_a:
+            return
+        dx = event.x - self._drag_start[0]
+        dy = event.y - self._drag_start[1]
+        self._drag_start = (event.x, event.y)
+
+        zoom = self._get_zoom()
+        if zoom is None:
+            zoom = self._fit_zoom(self.canvas_a)
+
+        self._center_x -= dx / zoom
+        self._center_y -= dy / zoom
+        self._clamp_center(zoom)
+        self._redraw()
+
+    def _on_drag_end(self, event):
+        self._drag_start = None
+
+    def _on_reset(self, event):
+        """Double-click resets to fit view."""
+        self._zoom_idx = None
+        if self.img_a:
+            iw, ih = self.img_a.size
+            self._center_x = iw / 2
+            self._center_y = ih / 2
+        self._redraw()
+
+    def _clamp_center(self, zoom):
+        """Keep the viewport from scrolling too far beyond the image edges."""
+        if not self.img_a:
+            return
+        iw, ih = self.img_a.size
+        # Allow panning up to half a canvas width beyond the edge
+        self._center_x = max(0, min(iw, self._center_x))
+        self._center_y = max(0, min(ih, self._center_y))
+
+    def _render_canvas(self, canvas, pil_img, zoom, cx, cy):
+        """Crop and scale the relevant region of pil_img and display on canvas."""
+        from PIL import ImageTk, Image as PILImage
+        canvas.update_idletasks()
+        cw = max(canvas.winfo_width(), 50)
+        ch = max(canvas.winfo_height(), 50)
+
+        if pil_img is None:
+            canvas.delete('all')
+            return None
+
+        iw, ih = pil_img.size
+
+        # How many image pixels are visible
+        view_w = cw / zoom
+        view_h = ch / zoom
+
+        # Crop bounds in image space
+        left = cx - view_w / 2
+        top = cy - view_h / 2
+        right = cx + view_w / 2
+        bottom = cy + view_h / 2
+
+        # Clamp to image bounds, calculate canvas offset for out-of-bounds
+        crop_left = max(0, int(left))
+        crop_top = max(0, int(top))
+        crop_right = min(iw, int(right) + 1)
+        crop_bottom = min(ih, int(bottom) + 1)
+
+        if crop_right <= crop_left or crop_bottom <= crop_top:
+            canvas.delete('all')
+            return None
+
+        cropped = pil_img.crop((crop_left, crop_top, crop_right, crop_bottom))
+
+        # Scale to display size
+        display_w = max(1, int((crop_right - crop_left) * zoom))
+        display_h = max(1, int((crop_bottom - crop_top) * zoom))
+
+        # Use NEAREST for zoom > 2× (pixel-level inspection), LANCZOS otherwise
+        resample = PILImage.Resampling.NEAREST if zoom >= 2.0 else PILImage.Resampling.LANCZOS
+        scaled = cropped.resize((display_w, display_h), resample)
+
+        photo = ImageTk.PhotoImage(scaled)
+
+        # Position on canvas: account for image edge offset
+        offset_x = int((crop_left - left) * zoom)
+        offset_y = int((crop_top - top) * zoom)
+
+        canvas.delete('all')
+        canvas.create_image(offset_x, offset_y, image=photo, anchor='nw')
+
+        return photo
+
+    def _redraw(self):
+        """Redraw both canvases with current viewport state."""
+        if not self.img_a:
+            return
+
+        zoom = self._get_zoom()
+        if zoom is None:
+            # Fit mode — use LANCZOS fit for both
+            zoom = self._fit_zoom(self.canvas_a)
+            iw, ih = self.img_a.size
+            cx, cy = iw / 2, ih / 2
+        else:
+            cx, cy = self._center_x, self._center_y
+
+        self.photo_a = self._render_canvas(self.canvas_a, self.img_a, zoom, cx, cy)
+        self.photo_b = self._render_canvas(self.canvas_b, self.img_b, zoom, cx, cy)
+
+        if self.status_label:
+            if self._zoom_idx is not None:
+                z = self.ZOOM_LEVELS[self._zoom_idx]
+                label = f"{z:.0f}×" if z >= 1 else f"{z:.2f}×"
+                self.status_label.config(
+                    text=f"🔍 {label}  (scroll to zoom, drag to pan, double-click to reset)")
+            else:
+                self.status_label.config(text="Fit to window  (scroll to zoom)")
+
+
 class TestTab(tk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent, bg=COLORS['bg'])
         self.app = app
-        self.original_photo = None
-        self.result_photo = None
+        self.original_pil = None
         self.result_image_pil = None
         self._cached_model = None
         self._cached_model_path = None
-        self._log_queue = queue.Queue()
 
         controls = tk.Frame(self, bg=COLORS['bg'])
         controls.pack(fill='x', padx=20, pady=(20, 0))
@@ -732,6 +967,8 @@ class TestTab(tk.Frame):
                                      command=self.save_result)
         self.save_btn.pack(side='left', padx=(8, 0))
         self.save_btn.config(state='disabled')
+        self.zoom_status = StyledLabel(btn_frame, text="", dim=True)
+        self.zoom_status.pack(side='right')
         self.status = StyledLabel(btn_frame, text="", dim=True)
         self.status.pack(side='left', padx=(12, 0))
 
@@ -755,21 +992,9 @@ class TestTab(tk.Frame):
         self.canvas_result = tk.Canvas(right, bg=COLORS['console_bg'], highlightthickness=0)
         self.canvas_result.pack(fill='both', expand=True, padx=4, pady=(0, 4))
 
-    def _fit_image(self, pil_img, canvas):
-        """Resize image to fit canvas with LANCZOS quality and display it."""
-        from PIL import ImageTk, Image as PILImage
-        canvas.update_idletasks()
-        cw = max(canvas.winfo_width(), 100)
-        ch = max(canvas.winfo_height(), 100)
-        iw, ih = pil_img.size
-        ratio = min(cw / iw, ch / ih)
-        new_w = max(1, int(iw * ratio))
-        new_h = max(1, int(ih * ratio))
-        resized = pil_img.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
-        photo = ImageTk.PhotoImage(resized)
-        canvas.delete('all')
-        canvas.create_image(cw // 2, ch // 2, image=photo, anchor='center')
-        return photo
+        # Synchronized zoom/pan viewer
+        self.viewer = SyncZoomViewer(self.canvas_orig, self.canvas_result,
+                                     status_label=self.zoom_status)
 
     def run_inference(self):
         img_path = self.image_path.get()
@@ -828,6 +1053,7 @@ class TestTab(tk.Frame):
                 Image.fromarray(b_out)
             ])
 
+            self.original_pil = img
             self.result_image_pil = result_img
             self.after(0, lambda: self._show_results(img, result_img))
 
@@ -838,8 +1064,7 @@ class TestTab(tk.Frame):
             self.after(0, lambda: self.run_btn.config(state='normal'))
 
     def _show_results(self, orig_pil, result_pil):
-        self.original_photo = self._fit_image(orig_pil, self.canvas_orig)
-        self.result_photo = self._fit_image(result_pil, self.canvas_result)
+        self.viewer.set_images(orig_pil, result_pil)
         self.save_btn.config(state='normal')
         self.status.config(text="Done!", fg=COLORS['success'])
 
