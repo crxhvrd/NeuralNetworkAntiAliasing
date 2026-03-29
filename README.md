@@ -17,8 +17,11 @@ pip install tensorflow numpy Pillow
 ## Quick Start
 
 ```bash
+cd models/nnaa
 python nnaa_studio.py
 ```
+
+> All settings (paths, hyperparameters) are automatically saved between sessions.
 
 ---
 
@@ -58,14 +61,29 @@ Aim for **200+ training pairs** across different scenes, lighting, and weather c
 ### 🏋 Train Tab
 
 1. Set the **dataset folder paths** for your training and test images
-2. Adjust **hyperparameters** if needed (defaults work well for most cases):
-   - **Learning Rate:** `0.00001` — lower = more stable, higher = faster
-   - **Train Batch:** `16` — reduce if you run out of memory
-   - **Epochs/Run:** `5` — how many epochs before evaluating
+2. Adjust **hyperparameters**:
+
+   | Parameter | Default | Description |
+   |-----------|---------|-------------|
+   | Learning Rate | `0.00001` | Initial LR. Auto-reduced by 50% when loss plateaus (ReduceLROnPlateau) |
+   | Train Batch | `16` | Reduce if you run out of memory |
+   | Test Batch | `4` | Batch size for evaluation |
+   | Epochs/Run | `5` | Epochs before evaluating on test set |
+   | Patch Size | `128` | Random crop size in pixels. Set `0` for full images |
+   | Patience | `20` | Stop after N evaluation runs with no improvement. Set `0` to disable |
+   | Augment | ✅ On | Random horizontal + vertical flips (4× effective data) |
+
 3. Set the **Model Name** and **Output Directory**
 4. Click **▶ Start Training**
-5. Watch the **Training Log** — the model auto-saves whenever it beats its best error score
-6. Click **■ Stop** when satisfied (training runs indefinitely otherwise)
+5. Monitor the **loss chart** and **training log** — the model auto-saves when it beats its best error
+6. Training stops automatically when patience is exceeded, or click **■ Stop** manually
+
+**Training features:**
+- 📈 Live loss sparkline chart with best-loss marker
+- ⏱ Elapsed time display
+- 🔄 Learning rate automatically halves when loss plateaus
+- 🎲 Data augmentation (random flips) and random patch cropping
+- ⚡ Parallel image loading for fast dataset caching
 
 The trained model is saved as `<output_dir>/<model_name>/<model_name>.keras`.
 
@@ -76,24 +94,36 @@ The trained model is saved as `<output_dir>/<model_name>/<model_name>.keras`.
 3. Click **⚡ Convert to Shader**
 4. Copy the generated `.fx` file to your ReShade `Shaders` folder
 
+The converter validates the model architecture before conversion and provides clear error messages if the model doesn't match the expected NNAA structure.
+
 ### 🧪 Test Tab
 
 1. Select a `.keras` model file
 2. Select an input image (an aliased screenshot)
 3. Click **▶ Run Inference** to see the before/after comparison
-4. Click **💾 Save Result** to export the anti-aliased image
+4. Use the **synchronized zoom viewer** to inspect details:
+
+   | Control | Action |
+   |---------|--------|
+   | Scroll wheel | Zoom in/out (0.25× to 32×) — zooms toward cursor |
+   | Click + drag | Pan both images simultaneously |
+   | Double-click | Reset to fit-to-window view |
+
+   At ≥2× zoom, pixel-perfect (nearest-neighbor) interpolation is used so you can inspect individual pixels.
+
+5. Click **💾 Save Result** to export the anti-aliased image
+
+> The model is cached — re-running inference on a different image with the same model is near-instant.
 
 ---
 
 ## Command-Line Usage
 
-You can also use the tools from the command line:
-
 ### Train
 ```bash
 python nnaa_train.py
 ```
-Edit the paths at the top of the script to point to your dataset.
+Edit the configuration variables at the top of the `if __name__` block to set dataset paths, learning rate, patch size, and patience.
 
 ### Convert
 ```bash
@@ -127,10 +157,15 @@ Produces `image_AA.png` (anti-aliased) and `image_AA_black_diff.png` (difference
 The model is a small CNN that operates on the brightness (luma) channel:
 
 ```
-Input Image → Extract Luma → Conv2D 8×8 → Conv2D 3×3 → Conv2D 3×3 → Conv2D 3×3 → ConvTranspose 2×2 → Add to Luma → Recombine Color
+Input → Luma → Conv2D 8×8 (stride 2) → 3× Conv2D 3×3 → ConvTranspose 2×2 → Residual → Recombine RGB
 ```
 
-The converter exports all learned weights as hardcoded HLSL constants in a ReShade compute shader, so the neural network runs entirely on the GPU in real-time.
+The converter exports all learned weights as hardcoded HLSL constants in a ReShade compute shader, using:
+- **Space-to-Depth** optimization for the 8×8 first layer
+- **Ping-pong storage textures** for intermediate layers
+- **Fused Depth-to-Space** for the final ConvTranspose layer
+
+The shader runs entirely on the GPU in real-time (~5 compute passes).
 
 ## Credits
 
