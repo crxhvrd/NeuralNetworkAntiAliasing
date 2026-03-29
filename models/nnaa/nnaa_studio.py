@@ -3,6 +3,7 @@ NNAA Shader Studio - A unified GUI for training, converting, and testing
 neural network anti-aliasing models for ReShade.
 
 Requires: tensorflow, numpy, Pillow
+Optional: matplotlib (for loss chart)
 """
 
 import tkinter as tk
@@ -11,10 +12,12 @@ import threading
 import queue
 import os
 import sys
+import json
+import time
 import traceback
 
 # ============================================================================
-# Theme colors
+# Theme
 # ============================================================================
 COLORS = {
     'bg':           '#1e1e2e',
@@ -39,6 +42,8 @@ COLORS = {
     'button_hover': '#9333ea',
     'stop_bg':      '#dc2626',
     'stop_hover':   '#ef4444',
+    'chart_line':   '#b4befe',
+    'chart_best':   '#a6e3a1',
 }
 
 FONT_FAMILY = 'Segoe UI'
@@ -48,9 +53,34 @@ FONT_TITLE = (FONT_FAMILY, 18, 'bold')
 FONT_CONSOLE = ('Consolas', 9)
 FONT_BUTTON = (FONT_FAMILY, 10, 'bold')
 FONT_TAB = (FONT_FAMILY, 11, 'bold')
+FONT_SMALL = (FONT_FAMILY, 9)
+
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.nnaa_studio_settings.json')
 
 # ============================================================================
-# Utility: styled widgets
+# Settings persistence
+# ============================================================================
+
+def load_settings():
+    """Load saved settings from JSON file."""
+    try:
+        with open(SETTINGS_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(data):
+    """Save settings to JSON file."""
+    try:
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+# ============================================================================
+# Styled widgets
 # ============================================================================
 
 class StyledEntry(tk.Entry):
@@ -69,14 +99,11 @@ class StyledEntry(tk.Entry):
 class StyledButton(tk.Button):
     def __init__(self, parent, accent=True, danger=False, **kwargs):
         if danger:
-            bg = COLORS['stop_bg']
-            hover = COLORS['stop_hover']
+            bg, hover = COLORS['stop_bg'], COLORS['stop_hover']
         elif accent:
-            bg = COLORS['button_bg']
-            hover = COLORS['button_hover']
+            bg, hover = COLORS['button_bg'], COLORS['button_hover']
         else:
-            bg = COLORS['accent_bg']
-            hover = COLORS['border']
+            bg, hover = COLORS['accent_bg'], COLORS['border']
         
         kwargs.setdefault('bg', bg)
         kwargs.setdefault('fg', COLORS['button_fg'])
@@ -90,8 +117,7 @@ class StyledButton(tk.Button):
         kwargs.setdefault('bd', 0)
         super().__init__(parent, **kwargs)
         
-        self._bg = bg
-        self._hover = hover
+        self._bg, self._hover = bg, hover
         self.bind('<Enter>', lambda e: self.config(bg=self._hover))
         self.bind('<Leave>', lambda e: self.config(bg=self._bg))
 
@@ -111,71 +137,83 @@ class StyledLabel(tk.Label):
         super().__init__(parent, **kwargs)
 
 
-class ConsoleText(tk.Text):
-    def __init__(self, parent, **kwargs):
-        kwargs.setdefault('bg', COLORS['console_bg'])
-        kwargs.setdefault('fg', COLORS['console_fg'])
-        kwargs.setdefault('font', FONT_CONSOLE)
-        kwargs.setdefault('relief', 'flat')
-        kwargs.setdefault('insertbackground', COLORS['console_fg'])
-        kwargs.setdefault('selectbackground', COLORS['accent_bg'])
-        kwargs.setdefault('highlightthickness', 1)
-        kwargs.setdefault('highlightbackground', COLORS['border'])
-        kwargs.setdefault('highlightcolor', COLORS['border'])
-        kwargs.setdefault('state', 'disabled')
-        kwargs.setdefault('wrap', 'word')
-        super().__init__(parent, **kwargs)
-        self.tag_configure('success', foreground=COLORS['success'])
-        self.tag_configure('error', foreground=COLORS['error'])
-        self.tag_configure('warning', foreground=COLORS['warning'])
-        self.tag_configure('accent', foreground=COLORS['accent'])
+class ThreadSafeConsole(tk.Frame):
+    """A console text widget that is safe to log to from any thread."""
+    
+    def __init__(self, parent, height=12, **kwargs):
+        super().__init__(parent, bg=COLORS['bg'])
+        self._queue = queue.Queue()
+        
+        self._text = tk.Text(self, bg=COLORS['console_bg'], fg=COLORS['console_fg'],
+                             font=FONT_CONSOLE, relief='flat',
+                             insertbackground=COLORS['console_fg'],
+                             selectbackground=COLORS['accent_bg'],
+                             highlightthickness=1,
+                             highlightbackground=COLORS['border'],
+                             highlightcolor=COLORS['border'],
+                             state='disabled', wrap='word', height=height)
+        scrollbar = tk.Scrollbar(self, command=self._text.yview,
+                                 bg=COLORS['bg_secondary'], troughcolor=COLORS['console_bg'],
+                                 highlightthickness=0, bd=0)
+        self._text.config(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side='right', fill='y')
+        self._text.pack(fill='both', expand=True)
 
-    def append(self, text, tag=None):
-        self.config(state='normal')
-        if tag:
-            self.insert('end', text, tag)
-        else:
-            self.insert('end', text)
-        self.see('end')
-        self.config(state='disabled')
+        for tag, color in [('success', COLORS['success']), ('error', COLORS['error']),
+                           ('warning', COLORS['warning']), ('accent', COLORS['accent'])]:
+            self._text.tag_configure(tag, foreground=color)
+
+        self._poll()
+
+    def _poll(self):
+        while not self._queue.empty():
+            msg, tag = self._queue.get_nowait()
+            self._text.config(state='normal')
+            if tag:
+                self._text.insert('end', msg, tag)
+            else:
+                self._text.insert('end', msg)
+            self._text.see('end')
+            self._text.config(state='disabled')
+        self.after(80, self._poll)
+
+    def log(self, msg, tag=None):
+        """Thread-safe log method — can be called from any thread."""
+        self._queue.put((msg, tag))
 
     def clear(self):
-        self.config(state='normal')
-        self.delete('1.0', 'end')
-        self.config(state='disabled')
+        """Clear the console (main thread only)."""
+        self._text.config(state='normal')
+        self._text.delete('1.0', 'end')
+        self._text.config(state='disabled')
 
 
 def make_path_row(parent, label_text, var, row, browse_type='folder'):
     """Create a label + entry + browse button row."""
-    StyledLabel(parent, text=label_text).grid(row=row, column=0, sticky='w', pady=(8, 2))
+    StyledLabel(parent, text=label_text).grid(row=row, column=0, sticky='w', pady=(6, 2))
     entry = StyledEntry(parent, textvariable=var)
-    entry.grid(row=row, column=1, sticky='ew', padx=(8, 4), pady=(8, 2))
+    entry.grid(row=row, column=1, sticky='ew', padx=(8, 4), pady=(6, 2))
 
     def browse():
         if browse_type == 'folder':
             path = filedialog.askdirectory()
         elif browse_type == 'open':
             path = filedialog.askopenfilename(filetypes=[
-                ("Keras Models", "*.keras *.h5"),
-                ("All Files", "*.*")
-            ])
+                ("Keras Models", "*.keras *.h5"), ("All Files", "*.*")])
         elif browse_type == 'open_image':
             path = filedialog.askopenfilename(filetypes=[
-                ("Images", "*.png *.jpg *.jpeg *.bmp"),
-                ("All Files", "*.*")
-            ])
+                ("Images", "*.png *.jpg *.jpeg *.bmp"), ("All Files", "*.*")])
         elif browse_type == 'save':
             path = filedialog.asksaveasfilename(
                 defaultextension='.fx',
-                filetypes=[("ReShade FX", "*.fx"), ("All Files", "*.*")]
-            )
+                filetypes=[("ReShade FX", "*.fx"), ("All Files", "*.*")])
         else:
             path = None
         if path:
             var.set(path)
 
     StyledButton(parent, text="Browse", accent=False, command=browse).grid(
-        row=row, column=2, padx=(0, 4), pady=(8, 2))
+        row=row, column=2, padx=(0, 4), pady=(6, 2))
     return entry
 
 
@@ -188,6 +226,84 @@ def make_param_row(parent, label_text, var, row, col_offset=0):
     return entry
 
 
+def format_time(seconds):
+    """Format seconds as H:MM:SS or M:SS."""
+    h, r = divmod(int(seconds), 3600)
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# ============================================================================
+# Loss chart widget (canvas-based, no matplotlib dependency)
+# ============================================================================
+
+class LossChart(tk.Canvas):
+    """A simple loss sparkline chart drawn on a canvas."""
+    
+    def __init__(self, parent, height=80, **kwargs):
+        super().__init__(parent, bg=COLORS['console_bg'], highlightthickness=1,
+                         highlightbackground=COLORS['border'], height=height, **kwargs)
+        self.losses = []
+        self.best_loss = None
+        self._pad = 8
+
+    def add_loss(self, loss_val):
+        self.losses.append(loss_val)
+        if self.best_loss is None or loss_val < self.best_loss:
+            self.best_loss = loss_val
+        self._redraw()
+
+    def clear_data(self):
+        self.losses = []
+        self.best_loss = None
+        self.delete('all')
+
+    def _redraw(self):
+        self.delete('all')
+        if len(self.losses) < 2:
+            return
+
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < 20 or h < 20:
+            return
+
+        pad = self._pad
+        plot_w = w - 2 * pad
+        plot_h = h - 2 * pad
+
+        min_v = min(self.losses)
+        max_v = max(self.losses)
+        val_range = max_v - min_v if max_v > min_v else 1e-8
+
+        n = len(self.losses)
+        points = []
+        for i, v in enumerate(self.losses):
+            x = pad + (i / (n - 1)) * plot_w
+            y = pad + (1 - (v - min_v) / val_range) * plot_h
+            points.append((x, y))
+
+        # Draw best loss line
+        if self.best_loss is not None:
+            by = pad + (1 - (self.best_loss - min_v) / val_range) * plot_h
+            self.create_line(pad, by, w - pad, by, fill=COLORS['chart_best'],
+                           dash=(4, 4), width=1)
+            self.create_text(w - pad - 2, by - 8, text=f"best: {self.best_loss:.6f}",
+                           fill=COLORS['chart_best'], font=FONT_SMALL, anchor='e')
+
+        # Draw loss curve
+        for i in range(len(points) - 1):
+            self.create_line(points[i][0], points[i][1],
+                           points[i+1][0], points[i+1][1],
+                           fill=COLORS['chart_line'], width=2, smooth=True)
+
+        # Current value label
+        self.create_text(pad + 2, pad, text=f"{max_v:.6f}",
+                        fill=COLORS['fg_dim'], font=FONT_SMALL, anchor='nw')
+        self.create_text(pad + 2, h - pad, text=f"{min_v:.6f}",
+                        fill=COLORS['fg_dim'], font=FONT_SMALL, anchor='sw')
+
+
 # ============================================================================
 # Tab: Train
 # ============================================================================
@@ -198,19 +314,21 @@ class TrainTab(tk.Frame):
         self.app = app
         self.training_thread = None
         self.stop_event = threading.Event()
-        self.log_queue = queue.Queue()
+        self.start_time = None
+
+        settings = app.settings
 
         # ── Dataset paths ──
         section = tk.Frame(self, bg=COLORS['bg'])
-        section.pack(fill='x', padx=20, pady=(16, 0))
+        section.pack(fill='x', padx=20, pady=(12, 0))
         StyledLabel(section, text="📁  Dataset Configuration", heading=True).grid(
             row=0, column=0, columnspan=3, sticky='w', pady=(0, 4))
         section.columnconfigure(1, weight=1)
 
-        self.train_bad = tk.StringVar(value='data/train/bad/1280x720')
-        self.train_good = tk.StringVar(value='data/train/fixed/1280x720')
-        self.test_bad = tk.StringVar(value='data/test/bad/2560x1440')
-        self.test_good = tk.StringVar(value='data/test/fixed/2560x1440')
+        self.train_bad = tk.StringVar(value=settings.get('train_bad', 'data/train/bad/1280x720'))
+        self.train_good = tk.StringVar(value=settings.get('train_good', 'data/train/fixed/1280x720'))
+        self.test_bad = tk.StringVar(value=settings.get('test_bad', 'data/test/bad/2560x1440'))
+        self.test_good = tk.StringVar(value=settings.get('test_good', 'data/test/fixed/2560x1440'))
 
         make_path_row(section, "Train — No AA:", self.train_bad, 1)
         make_path_row(section, "Train — With AA:", self.train_good, 2)
@@ -219,29 +337,41 @@ class TrainTab(tk.Frame):
 
         # ── Hyperparameters ──
         params = tk.Frame(self, bg=COLORS['bg'])
-        params.pack(fill='x', padx=20, pady=(16, 0))
+        params.pack(fill='x', padx=20, pady=(12, 0))
         StyledLabel(params, text="⚙  Hyperparameters", heading=True).grid(
-            row=0, column=0, columnspan=6, sticky='w', pady=(0, 4))
+            row=0, column=0, columnspan=8, sticky='w', pady=(0, 4))
 
-        self.lr = tk.StringVar(value='0.00001')
-        self.batch_size = tk.StringVar(value='16')
-        self.test_batch = tk.StringVar(value='4')
-        self.epochs_per_run = tk.StringVar(value='5')
+        self.lr = tk.StringVar(value=settings.get('lr', '0.00001'))
+        self.batch_size = tk.StringVar(value=settings.get('batch_size', '16'))
+        self.test_batch = tk.StringVar(value=settings.get('test_batch', '4'))
+        self.epochs_per_run = tk.StringVar(value=settings.get('epochs_per_run', '5'))
+        self.patch_size = tk.StringVar(value=settings.get('patch_size', '128'))
+        self.patience = tk.StringVar(value=settings.get('patience', '20'))
+        self.augment = tk.BooleanVar(value=settings.get('augment', True))
 
         make_param_row(params, "Learning Rate:", self.lr, 1, 0)
         make_param_row(params, "Train Batch:", self.batch_size, 1, 2)
         make_param_row(params, "Test Batch:", self.test_batch, 1, 4)
         make_param_row(params, "Epochs/Run:", self.epochs_per_run, 2, 0)
+        make_param_row(params, "Patch Size:", self.patch_size, 2, 2)
+        make_param_row(params, "Patience:", self.patience, 2, 4)
+
+        # Augment checkbox
+        aug_cb = tk.Checkbutton(params, text="Augment (flips)", variable=self.augment,
+                                bg=COLORS['bg'], fg=COLORS['fg'], selectcolor=COLORS['bg_input'],
+                                activebackground=COLORS['bg'], activeforeground=COLORS['fg'],
+                                font=FONT_LABEL, cursor='hand2')
+        aug_cb.grid(row=2, column=6, columnspan=2, sticky='w', padx=(0, 4), pady=(4, 2))
 
         # ── Model output ──
         model_frame = tk.Frame(self, bg=COLORS['bg'])
-        model_frame.pack(fill='x', padx=20, pady=(16, 0))
+        model_frame.pack(fill='x', padx=20, pady=(12, 0))
         model_frame.columnconfigure(1, weight=1)
         StyledLabel(model_frame, text="💾  Model Output", heading=True).grid(
             row=0, column=0, columnspan=3, sticky='w', pady=(0, 4))
 
-        self.model_name = tk.StringVar(value='nnaa')
-        self.model_dir = tk.StringVar(value='..')
+        self.model_name = tk.StringVar(value=settings.get('model_name', 'nnaa'))
+        self.model_dir = tk.StringVar(value=settings.get('model_dir', '..'))
         make_param_row(model_frame, "Model Name:", self.model_name, 1, 0)
         StyledLabel(model_frame, text="Output Dir:").grid(row=2, column=0, sticky='w', pady=(4, 2))
         StyledEntry(model_frame, textvariable=self.model_dir).grid(
@@ -251,9 +381,9 @@ class TrainTab(tk.Frame):
                          filedialog.askdirectory() or self.model_dir.get()
                      )).grid(row=2, column=2, padx=(0, 4), pady=(4, 2))
 
-        # ── Buttons ──
+        # ── Buttons + status ──
         btn_frame = tk.Frame(self, bg=COLORS['bg'])
-        btn_frame.pack(fill='x', padx=20, pady=(16, 0))
+        btn_frame.pack(fill='x', padx=20, pady=(12, 0))
 
         self.start_btn = StyledButton(btn_frame, text="▶  Start Training", command=self.start_training)
         self.start_btn.pack(side='left', padx=(0, 8))
@@ -261,60 +391,108 @@ class TrainTab(tk.Frame):
         self.stop_btn.pack(side='left')
         self.stop_btn.config(state='disabled')
         
-        self.status_label = StyledLabel(btn_frame, text="", dim=True)
+        self.status_label = StyledLabel(btn_frame, text="Idle", dim=True)
         self.status_label.pack(side='right')
+        self.timer_label = StyledLabel(btn_frame, text="", dim=True)
+        self.timer_label.pack(side='right', padx=(0, 12))
+
+        # ── Loss chart ──
+        chart_frame = tk.Frame(self, bg=COLORS['bg'])
+        chart_frame.pack(fill='x', padx=20, pady=(8, 0))
+        StyledLabel(chart_frame, text="📈  Loss", heading=True).pack(anchor='w', pady=(0, 2))
+        self.loss_chart = LossChart(chart_frame, height=80)
+        self.loss_chart.pack(fill='x')
 
         # ── Console ──
         console_frame = tk.Frame(self, bg=COLORS['bg'])
-        console_frame.pack(fill='both', expand=True, padx=20, pady=(12, 16))
-        StyledLabel(console_frame, text="📋  Training Log", heading=True).pack(anchor='w', pady=(0, 4))
-        
-        self.console = ConsoleText(console_frame, height=12)
-        scrollbar = tk.Scrollbar(console_frame, command=self.console.yview,
-                                 bg=COLORS['bg_secondary'], troughcolor=COLORS['console_bg'],
-                                 highlightthickness=0, bd=0)
-        self.console.config(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side='right', fill='y')
+        console_frame.pack(fill='both', expand=True, padx=20, pady=(8, 12))
+        StyledLabel(console_frame, text="📋  Training Log", heading=True).pack(anchor='w', pady=(0, 2))
+        self.console = ThreadSafeConsole(console_frame, height=8)
         self.console.pack(fill='both', expand=True)
 
-        self.console.append("Welcome to NNAA Shader Studio!\n", 'accent')
-        self.console.append("Configure your dataset paths and click Start Training.\n")
+        self.console.log("Welcome to NNAA Shader Studio!\n", 'accent')
+        self.console.log("Configure your dataset paths and click Start Training.\n")
 
-        self._poll_log()
+    def _save_settings(self):
+        """Persist current field values."""
+        self.app.settings.update({
+            'train_bad': self.train_bad.get(),
+            'train_good': self.train_good.get(),
+            'test_bad': self.test_bad.get(),
+            'test_good': self.test_good.get(),
+            'lr': self.lr.get(),
+            'batch_size': self.batch_size.get(),
+            'test_batch': self.test_batch.get(),
+            'epochs_per_run': self.epochs_per_run.get(),
+            'patch_size': self.patch_size.get(),
+            'patience': self.patience.get(),
+            'augment': self.augment.get(),
+            'model_name': self.model_name.get(),
+            'model_dir': self.model_dir.get(),
+        })
+        save_settings(self.app.settings)
 
-    def _poll_log(self):
-        """Pull messages from the log queue and display them."""
-        while not self.log_queue.empty():
-            msg, tag = self.log_queue.get_nowait()
-            self.console.append(msg, tag)
-        self.after(100, self._poll_log)
-
-    def log(self, msg, tag=None):
-        self.log_queue.put((msg, tag))
+    def _validate_paths(self):
+        """Check that dataset directories exist and contain matching files."""
+        paths = {
+            'Train No AA': self.train_bad.get(),
+            'Train With AA': self.train_good.get(),
+            'Test No AA': self.test_bad.get(),
+            'Test With AA': self.test_good.get(),
+        }
+        for name, path in paths.items():
+            if not os.path.isdir(path):
+                messagebox.showerror("Invalid Path",
+                    f'"{name}" directory does not exist:\n{path}')
+                return False
+        
+        # Check for matching files in train set
+        train_bad_files = set(os.listdir(self.train_bad.get()))
+        train_good_files = set(os.listdir(self.train_good.get()))
+        common = train_bad_files & train_good_files
+        if not common:
+            messagebox.showerror("No Matching Files",
+                "No matching filenames found between the Train directories.\n"
+                "Both folders must contain images with the same filenames.")
+            return False
+        return True
 
     def start_training(self):
+        if not self._validate_paths():
+            return
+        self._save_settings()
+        
         self.start_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
         self.stop_event.clear()
+        self.start_time = time.time()
         self.status_label.config(text="Training...", fg=COLORS['success'])
         self.console.clear()
-        self.log("Starting training...\n", 'accent')
+        self.loss_chart.clear_data()
+        self.console.log("Starting training...\n", 'accent')
+        self._update_timer()
 
         self.training_thread = threading.Thread(target=self._train_worker, daemon=True)
         self.training_thread.start()
 
     def stop_training(self):
         self.stop_event.set()
-        self.log("\n⏹  Stop requested. Finishing current epoch...\n", 'warning')
+        self.console.log("\n⏹  Stop requested. Finishing current epoch...\n", 'warning')
+
+    def _update_timer(self):
+        """Update the elapsed time display."""
+        if self.start_time and not self.stop_event.is_set():
+            elapsed = time.time() - self.start_time
+            self.timer_label.config(text=f"⏱ {format_time(elapsed)}")
+            self.after(1000, self._update_timer)
 
     def _train_worker(self):
         try:
-            self.log("Importing TensorFlow... ", None)
+            self.console.log("Importing TensorFlow... ", None)
             import tensorflow as tf
             import numpy as np
-            self.log("OK\n", 'success')
+            self.console.log("OK\n", 'success')
 
-            # Import the dataset class from nnaa_train
             script_dir = os.path.dirname(os.path.abspath(__file__))
             sys.path.insert(0, script_dir)
             from nnaa_train import NnaaDataset
@@ -323,34 +501,28 @@ class TrainTab(tk.Frame):
             batch_size = int(self.batch_size.get())
             test_batch = int(self.test_batch.get())
             epochs = int(self.epochs_per_run.get())
+            patch_size = int(self.patch_size.get())
+            patience_val = int(self.patience.get())
+            do_augment = self.augment.get()
             model_name = self.model_name.get()
             models_path = self.model_dir.get()
-
-            base_dir = self.train_bad.get()
-            target_dir = self.train_good.get()
-            test_base = self.test_bad.get()
-            test_target = self.test_good.get()
 
             model_directory = os.path.join(models_path, model_name)
             model_path = os.path.join(model_directory, model_name) + ".keras"
 
-            self.log(f"Model path: {model_path}\n")
-            self.log(f"Learning rate: {lr}\n")
-            self.log(f"Batch size: {batch_size} (train), {test_batch} (test)\n")
-            self.log(f"Epochs per run: {epochs}\n\n")
+            self.console.log(f"Model path: {model_path}\n")
+            self.console.log(f"LR: {lr}  |  Batch: {batch_size}/{test_batch}  |  Epochs/run: {epochs}\n")
+            self.console.log(f"Patch: {patch_size if patch_size > 0 else 'full'}  |  Augment: {do_augment}  |  Patience: {patience_val}\n\n")
 
-            if not os.path.isdir(model_directory):
-                os.makedirs(model_directory, exist_ok=True)
-                self.log(f"Created directory: {model_directory}\n")
-
+            os.makedirs(model_directory, exist_ok=True)
             loss_fn = tf.keras.losses.MeanSquaredError()
 
             if os.path.isfile(model_path):
-                self.log("Loading existing model... ", None)
+                self.console.log("Loading existing model... ", None)
                 model = tf.keras.models.load_model(model_path)
-                self.log("OK\n", 'success')
+                self.console.log("OK\n", 'success')
             else:
-                self.log("Creating new model... ", None)
+                self.console.log("Creating new model... ", None)
                 input_layer = tf.keras.Input(shape=(None, None, 1), name="img")
                 x = tf.keras.layers.PReLU(shared_axes=[1, 2])(
                     tf.keras.layers.Conv2D(32, 8, strides=2, padding='same')(input_layer))
@@ -365,66 +537,90 @@ class TrainTab(tk.Frame):
                 model = tf.keras.Model(input_layer, output, name=model_name)
                 model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
                               loss=loss_fn, metrics=['mean_squared_error'])
-                self.log("OK\n", 'success')
+                self.console.log("OK\n", 'success')
 
             if model.optimizer.learning_rate != lr:
                 model.optimizer.learning_rate = lr
-                self.log(f"Updated learning rate to {lr}\n", 'warning')
+                self.console.log(f"Updated learning rate to {lr}\n", 'warning')
 
-            # Model summary
             summary_lines = []
             model.summary(print_fn=lambda x: summary_lines.append(x))
-            self.log('\n'.join(summary_lines) + '\n\n', None)
+            self.console.log('\n'.join(summary_lines) + '\n\n', None)
 
-            self.log("Loading dataset... ", None)
-            train_dataset = NnaaDataset(base_dir, target_dir, batch_size, use_cache=True)
-            test_dataset = NnaaDataset(test_base, test_target, test_batch, use_cache=True)
-            self.log(f"OK ({len(train_dataset)} train batches, {len(test_dataset)} test batches)\n", 'success')
+            self.console.log("Loading dataset... ", None)
+            train_dataset = NnaaDataset(self.train_bad.get(), self.train_good.get(),
+                                        batch_size, use_cache=True,
+                                        patch_size=patch_size, augment=do_augment)
+            test_dataset = NnaaDataset(self.test_bad.get(), self.test_good.get(),
+                                       test_batch, use_cache=True,
+                                       patch_size=0, augment=False)
+            self.console.log(
+                f"OK ({len(train_dataset)} train, {len(test_dataset)} test batches, "
+                f"{len(train_dataset.img_names)} images)\n", 'success')
+
+            # LR scheduler — halve LR when training loss plateaus
+            lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='loss', factor=0.5, patience=3, min_lr=1e-7, verbose=0)
 
             best_error = float('inf')
             best_path = os.path.join(model_directory, "bestError.npy")
             if os.path.isfile(best_path):
                 best_error = np.load(best_path).item()
-            self.log(f"Best error so far: {best_error}\n\n")
+            self.console.log(f"Best error so far: {best_error}\n\n")
 
+            no_improve = 0
             run = 0
             while not self.stop_event.is_set():
                 run += 1
-                self.log(f"━━━ Run {run} ━━━\n", 'accent')
+                self.console.log(f"━━━ Run {run} ━━━\n", 'accent')
 
-                # Train
-                history = model.fit(train_dataset, epochs=epochs, verbose=0)
+                history = model.fit(train_dataset, epochs=epochs, verbose=0,
+                                    callbacks=[lr_scheduler])
                 for epoch_idx, loss_val in enumerate(history.history['loss']):
-                    self.log(f"  Epoch {epoch_idx + 1}/{epochs} — loss: {loss_val:.8f}\n")
+                    self.console.log(f"  Epoch {epoch_idx + 1}/{epochs} — loss: {loss_val:.8f}\n")
+                    self.after(0, lambda v=loss_val: self.loss_chart.add_loss(v))
+
+                current_lr = float(model.optimizer.learning_rate)
+                self.console.log(f"  LR: {current_lr:.2e}\n", 'accent')
 
                 if self.stop_event.is_set():
                     break
 
-                # Evaluate
                 eval_result = model.evaluate(test_dataset, verbose=0)
-                self.log(f"  Eval — loss: {eval_result[0]:.8f}, mse: {eval_result[1]:.8f}\n")
+                self.console.log(f"  Eval — loss: {eval_result[0]:.8f}, mse: {eval_result[1]:.8f}\n")
 
                 if eval_result[0] < best_error:
                     best_error = eval_result[0]
                     np.save(best_path, best_error)
                     model.save(model_path)
-                    self.log(f"  ★ New best! Saved model (error: {best_error:.8f})\n", 'success')
+                    self.console.log(f"  ★ New best! Saved (error: {best_error:.8f})\n", 'success')
+                    no_improve = 0
                 else:
-                    self.log(f"  No improvement (best: {best_error:.8f})\n", 'warning')
-                self.log('\n')
+                    no_improve += 1
+                    self.console.log(
+                        f"  No improvement ({no_improve}/{patience_val}, best: {best_error:.8f})\n", 'warning')
 
-            self.log("Training stopped.\n", 'accent')
+                    if patience_val > 0 and no_improve >= patience_val:
+                        self.console.log(
+                            f"\n⏹  Early stopping: no improvement for {patience_val} runs.\n", 'warning')
+                        break
+                self.console.log('\n')
+
+            self.console.log("Training stopped.\n", 'accent')
 
         except Exception as e:
-            self.log(f"\n✗ Error: {e}\n", 'error')
-            self.log(traceback.format_exc() + '\n', 'error')
+            self.console.log(f"\n✗ Error: {e}\n", 'error')
+            self.console.log(traceback.format_exc() + '\n', 'error')
         finally:
             self.after(0, self._training_finished)
 
     def _training_finished(self):
         self.start_btn.config(state='normal')
         self.stop_btn.config(state='disabled')
+        elapsed = time.time() - self.start_time if self.start_time else 0
         self.status_label.config(text="Idle", fg=COLORS['fg_dim'])
+        self.timer_label.config(text=f"Done in {format_time(elapsed)}")
+        self.start_time = None
 
 
 # ============================================================================
@@ -436,19 +632,18 @@ class ConvertTab(tk.Frame):
         super().__init__(parent, bg=COLORS['bg'])
         self.app = app
 
-        # ── Input/Output ──
         section = tk.Frame(self, bg=COLORS['bg'])
         section.pack(fill='x', padx=20, pady=(20, 0))
         section.columnconfigure(1, weight=1)
         StyledLabel(section, text="🔄  Keras → ReShade FX Converter", heading=True).grid(
             row=0, column=0, columnspan=3, sticky='w', pady=(0, 8))
 
-        self.model_path = tk.StringVar(value='nnaa.keras')
-        self.output_path = tk.StringVar(value='out_nnaa.fx')
+        settings = app.settings
+        self.model_path = tk.StringVar(value=settings.get('convert_model', 'nnaa.keras'))
+        self.output_path = tk.StringVar(value=settings.get('convert_output', 'out_nnaa.fx'))
         make_path_row(section, "Keras Model:", self.model_path, 1, browse_type='open')
         make_path_row(section, "Output .fx:", self.output_path, 2, browse_type='save')
 
-        # ── Button ──
         btn_frame = tk.Frame(self, bg=COLORS['bg'])
         btn_frame.pack(fill='x', padx=20, pady=(16, 0))
         self.convert_btn = StyledButton(btn_frame, text="⚡  Convert to Shader",
@@ -457,21 +652,20 @@ class ConvertTab(tk.Frame):
         self.status = StyledLabel(btn_frame, text="", dim=True)
         self.status.pack(side='left', padx=(12, 0))
 
-        # ── Console ──
         console_frame = tk.Frame(self, bg=COLORS['bg'])
         console_frame.pack(fill='both', expand=True, padx=20, pady=(12, 16))
         StyledLabel(console_frame, text="📋  Conversion Log", heading=True).pack(anchor='w', pady=(0, 4))
-        self.console = ConsoleText(console_frame, height=16)
-        scrollbar = tk.Scrollbar(console_frame, command=self.console.yview,
-                                 bg=COLORS['bg_secondary'], troughcolor=COLORS['console_bg'],
-                                 highlightthickness=0, bd=0)
-        self.console.config(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side='right', fill='y')
+        self.console = ThreadSafeConsole(console_frame, height=16)
         self.console.pack(fill='both', expand=True)
-
-        self.console.append("Select a .keras model file and output path, then click Convert.\n")
+        self.console.log("Select a .keras model file and output path, then click Convert.\n")
 
     def do_convert(self):
+        self.app.settings.update({
+            'convert_model': self.model_path.get(),
+            'convert_output': self.output_path.get(),
+        })
+        save_settings(self.app.settings)
+        
         self.convert_btn.config(state='disabled')
         self.status.config(text="Converting...", fg=COLORS['warning'])
         self.console.clear()
@@ -479,79 +673,25 @@ class ConvertTab(tk.Frame):
 
     def _convert_worker(self):
         try:
-            self.console.append("Loading model...\n", 'accent')
-            
-            # Import the converter
             script_dir = os.path.dirname(os.path.abspath(__file__))
             sys.path.insert(0, script_dir)
+            import importlib
             import convert
+            importlib.reload(convert)
 
-            model_path = self.model_path.get()
-            output_path = self.output_path.get()
-
-            if not os.path.isfile(model_path):
-                self.console.append(f"✗ Model file not found: {model_path}\n", 'error')
-                return
-
-            layers = convert.load_model_weights(model_path)
-
-            self.console.append("Extracted layers:\n")
-            for i, layer in enumerate(layers):
-                shapes = [w.shape for w in layer['weights']]
-                self.console.append(f"  [{i}] {layer['name']} ({layer['type']}): {shapes}\n")
-
-            conv0_kernel, conv0_bias = layers[0]['weights']
-            prelu0_alpha = layers[1]['weights'][0]
-            conv1_kernel, conv1_bias = layers[2]['weights']
-            prelu1_alpha = layers[3]['weights'][0]
-            conv2_kernel, conv2_bias = layers[4]['weights']
-            prelu2_alpha = layers[5]['weights'][0]
-            conv3_kernel, conv3_bias = layers[6]['weights']
-            prelu3_alpha = layers[7]['weights'][0]
-            final_kernel, final_bias = layers[8]['weights']
-
-            self.console.append("\nGenerating shader...\n", 'accent')
-
-            parts = []
-            parts.append(convert.generate_header())
-
-            self.console.append("  Layer conv2d (8x8)... ")
-            parts.append(convert.generate_first_conv_layer(conv0_kernel, conv0_bias, prelu0_alpha))
-            self.console.append("OK\n", 'success')
-
-            self.console.append("  Layer conv2d_1 (3x3)... ")
-            parts.append('\n')
-            parts.append(convert.generate_mid_conv_layer(1, conv1_kernel, conv1_bias, prelu1_alpha))
-            self.console.append("OK\n", 'success')
-
-            self.console.append("  Layer conv2d_2 (3x3)... ")
-            parts.append('\n')
-            parts.append(convert.generate_mid_conv_layer(2, conv2_kernel, conv2_bias, prelu2_alpha))
-            self.console.append("OK\n", 'success')
-
-            self.console.append("  Layer conv2d_3 + final (fused)... ")
-            parts.append('\n')
-            parts.append(convert.generate_mid_conv_layer(3, conv3_kernel, conv3_bias, prelu3_alpha,
-                                                         is_last_hidden=True,
-                                                         final_kernel=final_kernel,
-                                                         final_bias=final_bias))
-            self.console.append("OK\n", 'success')
-
-            parts.append(convert.generate_technique())
-
-            shader_code = '\n'.join(parts)
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(shader_code)
-
-            lines = shader_code.count('\n')
-            size = len(shader_code)
-            self.console.append(f"\n✓ Shader saved to: {output_path}\n", 'success')
-            self.console.append(f"  {size:,} bytes, {lines:,} lines\n", 'success')
+            result = convert.convert_model(
+                self.model_path.get(),
+                self.output_path.get(),
+                log_fn=self.console.log
+            )
             self.after(0, lambda: self.status.config(text="Done!", fg=COLORS['success']))
 
+        except (FileNotFoundError, ValueError) as e:
+            self.console.log(f"\n✗ {e}\n", 'error')
+            self.after(0, lambda: self.status.config(text="Failed", fg=COLORS['error']))
         except Exception as e:
-            self.console.append(f"\n✗ Error: {e}\n", 'error')
-            self.console.append(traceback.format_exc() + '\n', 'error')
+            self.console.log(f"\n✗ Error: {e}\n", 'error')
+            self.console.log(traceback.format_exc() + '\n', 'error')
             self.after(0, lambda: self.status.config(text="Failed", fg=COLORS['error']))
         finally:
             self.after(0, lambda: self.convert_btn.config(state='normal'))
@@ -568,16 +708,19 @@ class TestTab(tk.Frame):
         self.original_photo = None
         self.result_photo = None
         self.result_image_pil = None
+        self._cached_model = None
+        self._cached_model_path = None
+        self._log_queue = queue.Queue()
 
-        # ── Controls ──
         controls = tk.Frame(self, bg=COLORS['bg'])
         controls.pack(fill='x', padx=20, pady=(20, 0))
         controls.columnconfigure(1, weight=1)
         StyledLabel(controls, text="🧪  Test Model on Image", heading=True).grid(
             row=0, column=0, columnspan=4, sticky='w', pady=(0, 8))
 
-        self.model_path = tk.StringVar(value='nnaa.keras')
-        self.image_path = tk.StringVar()
+        settings = app.settings
+        self.model_path = tk.StringVar(value=settings.get('test_model', 'nnaa.keras'))
+        self.image_path = tk.StringVar(value=settings.get('test_image', ''))
         make_path_row(controls, "Keras Model:", self.model_path, 1, browse_type='open')
         make_path_row(controls, "Input Image:", self.image_path, 2, browse_type='open_image')
 
@@ -592,11 +735,10 @@ class TestTab(tk.Frame):
         self.status = StyledLabel(btn_frame, text="", dim=True)
         self.status.pack(side='left', padx=(12, 0))
 
-        # ── Image display ──
+        # Image display
         img_container = tk.Frame(self, bg=COLORS['bg'])
         img_container.pack(fill='both', expand=True, padx=20, pady=(12, 16))
 
-        # Before
         left = tk.Frame(img_container, bg=COLORS['bg_secondary'], highlightthickness=1,
                         highlightbackground=COLORS['border'])
         left.pack(side='left', fill='both', expand=True, padx=(0, 6))
@@ -605,7 +747,6 @@ class TestTab(tk.Frame):
         self.canvas_orig = tk.Canvas(left, bg=COLORS['console_bg'], highlightthickness=0)
         self.canvas_orig.pack(fill='both', expand=True, padx=4, pady=(0, 4))
 
-        # After
         right = tk.Frame(img_container, bg=COLORS['bg_secondary'], highlightthickness=1,
                          highlightbackground=COLORS['border'])
         right.pack(side='left', fill='both', expand=True, padx=(6, 0))
@@ -615,8 +756,8 @@ class TestTab(tk.Frame):
         self.canvas_result.pack(fill='both', expand=True, padx=4, pady=(0, 4))
 
     def _fit_image(self, pil_img, canvas):
-        """Resize image to fit canvas and display it."""
-        from PIL import ImageTk
+        """Resize image to fit canvas with LANCZOS quality and display it."""
+        from PIL import ImageTk, Image as PILImage
         canvas.update_idletasks()
         cw = max(canvas.winfo_width(), 100)
         ch = max(canvas.winfo_height(), 100)
@@ -624,11 +765,11 @@ class TestTab(tk.Frame):
         ratio = min(cw / iw, ch / ih)
         new_w = max(1, int(iw * ratio))
         new_h = max(1, int(ih * ratio))
-        resized = pil_img.resize((new_w, new_h))
+        resized = pil_img.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
         photo = ImageTk.PhotoImage(resized)
         canvas.delete('all')
         canvas.create_image(cw // 2, ch // 2, image=photo, anchor='center')
-        return photo  # must keep reference
+        return photo
 
     def run_inference(self):
         img_path = self.image_path.get()
@@ -640,6 +781,12 @@ class TestTab(tk.Frame):
             messagebox.showerror("Error", "Please select a valid .keras model.")
             return
 
+        self.app.settings.update({
+            'test_model': model_path,
+            'test_image': img_path,
+        })
+        save_settings(self.app.settings)
+
         self.run_btn.config(state='disabled')
         self.status.config(text="Running inference...", fg=COLORS['warning'])
         threading.Thread(target=self._inference_worker, args=(model_path, img_path), daemon=True).start()
@@ -650,23 +797,25 @@ class TestTab(tk.Frame):
             import numpy as np
             import tensorflow as tf
 
-            model = tf.keras.models.load_model(model_path)
+            # Cache the model — only reload if path changed
+            if self._cached_model_path != model_path:
+                self._cached_model = tf.keras.models.load_model(model_path)
+                self._cached_model_path = model_path
+            model = self._cached_model
 
-            img = Image.open(img_path)
-            channels = img.split()
-            r = np.float32(channels[0])
-            g = np.float32(channels[1])
-            b = np.float32(channels[2])
+            img = Image.open(img_path).convert('RGB')  # Handle RGBA/grayscale safely
+            r, g, b = [np.float32(ch) for ch in img.split()]
 
             y = r * 0.299 + g * 0.587 + b * 0.114
             cb = r * -0.1687 + g * -0.3313 + b * 0.5
             cr = r * 0.5 + g * -0.4187 + b * -0.0813
 
-            tensor = y.reshape(1, channels[0].size[1], channels[0].size[0], 1) / 255.0
+            h, w = img.size[1], img.size[0]
+            tensor = y.reshape(1, h, w, 1) / 255.0
             prediction = model(tensor)
             tensor += prediction
 
-            result_y = np.float32(tensor).reshape(channels[0].size[1], channels[0].size[0])
+            result_y = np.float32(tensor).reshape(h, w)
             result_y = (result_y * 255).round().clip(0, 255)
 
             r_out = np.uint8((result_y + 1.402 * cr).round().clip(0, 255))
@@ -680,8 +829,6 @@ class TestTab(tk.Frame):
             ])
 
             self.result_image_pil = result_img
-
-            # Display on main thread
             self.after(0, lambda: self._show_results(img, result_img))
 
         except Exception as e:
@@ -701,8 +848,7 @@ class TestTab(tk.Frame):
             return
         path = filedialog.asksaveasfilename(
             defaultextension='.png',
-            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("All Files", "*.*")]
-        )
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("All Files", "*.*")])
         if path:
             self.result_image_pil.save(path)
             self.status.config(text=f"Saved: {os.path.basename(path)}", fg=COLORS['success'])
@@ -714,57 +860,57 @@ class TestTab(tk.Frame):
 
 class NNAAStudioApp:
     def __init__(self):
+        self.settings = load_settings()
         self.root = tk.Tk()
         self.root.title("NNAA Shader Studio")
-        self.root.geometry("900x720")
-        self.root.minsize(750, 550)
+        self.root.geometry("900x750")
+        self.root.minsize(750, 600)
         self.root.configure(bg=COLORS['bg'])
 
-        # Try to set dark title bar on Windows
+        # Dark title bar on Windows
         try:
-            from ctypes import windll
+            from ctypes import windll, c_int, sizeof, byref
             self.root.update()
             hwnd = windll.user32.GetParent(self.root.winfo_id())
-            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-            windll.dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                                                 byref := (c_int := __import__('ctypes').c_int)(1),
-                                                 __import__('ctypes').sizeof(c_int))
+            val = c_int(1)
+            windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, byref(val), sizeof(val))
         except Exception:
             pass
 
         self._build_titlebar()
         self._build_tabs()
 
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        """Save settings on exit."""
+        save_settings(self.settings)
+        self.root.destroy()
+
     def _build_titlebar(self):
-        """Build the custom title/header area."""
         header = tk.Frame(self.root, bg=COLORS['bg'], height=56)
-        header.pack(fill='x', padx=0, pady=0)
+        header.pack(fill='x')
         header.pack_propagate(False)
 
-        # App title
         title_frame = tk.Frame(header, bg=COLORS['bg'])
         title_frame.pack(side='left', padx=20, pady=8)
         tk.Label(title_frame, text="⚡", font=(FONT_FAMILY, 22), bg=COLORS['bg'],
                  fg=COLORS['accent']).pack(side='left', padx=(0, 8))
         tk.Label(title_frame, text="NNAA Shader Studio", font=FONT_TITLE,
                  bg=COLORS['bg'], fg=COLORS['fg_bright']).pack(side='left')
-
-        # Subtitle
         tk.Label(title_frame, text="Neural Network Anti-Aliasing", font=(FONT_FAMILY, 9),
                  bg=COLORS['bg'], fg=COLORS['fg_dim']).pack(side='left', padx=(12, 0), pady=(6, 0))
 
-        # Separator
-        sep = tk.Frame(self.root, bg=COLORS['border'], height=1)
-        sep.pack(fill='x')
+        tk.Frame(self.root, bg=COLORS['border'], height=1).pack(fill='x')
 
     def _build_tabs(self):
-        """Build the tab navigation and content area."""
-        # Custom tab bar
+        # Tab bar
         tab_bar = tk.Frame(self.root, bg=COLORS['bg_secondary'], height=42)
         tab_bar.pack(fill='x')
         tab_bar.pack_propagate(False)
 
         self.tab_buttons = []
+        self.tab_indicators = []
         self.tab_frames = []
         self.current_tab = 0
 
@@ -774,44 +920,51 @@ class NNAAStudioApp:
             ("🧪  Test", TestTab),
         ]
 
-        # Content container
         self.content = tk.Frame(self.root, bg=COLORS['bg'])
-        self.content.pack(fill='both', expand=True)
 
         for i, (label, tab_class) in enumerate(tab_defs):
-            btn = tk.Label(tab_bar, text=label, font=FONT_TAB,
+            tab_container = tk.Frame(tab_bar, bg=COLORS['bg_secondary'])
+            tab_container.pack(side='left')
+
+            btn = tk.Label(tab_container, text=label, font=FONT_TAB,
                            bg=COLORS['bg_secondary'], fg=COLORS['tab_inactive'],
                            padx=20, pady=8, cursor='hand2')
-            btn.pack(side='left')
+            btn.pack()
+
+            # Underline indicator
+            indicator = tk.Frame(tab_container, bg=COLORS['bg_secondary'], height=3)
+            indicator.pack(fill='x')
+
             btn.bind('<Button-1>', lambda e, idx=i: self._switch_tab(idx))
-            btn.bind('<Enter>', lambda e, b=btn: b.config(
-                fg=COLORS['tab_active'] if b != self.tab_buttons[self.current_tab]
-                else COLORS['tab_active']))
+            btn.bind('<Enter>', lambda e, b=btn, idx=i: b.config(
+                fg=COLORS['tab_active']) if idx != self.current_tab else None)
             btn.bind('<Leave>', lambda e, b=btn, idx=i: b.config(
-                fg=COLORS['tab_active'] if idx == self.current_tab
-                else COLORS['tab_inactive']))
+                fg=COLORS['tab_inactive']) if idx != self.current_tab else None)
+
             self.tab_buttons.append(btn)
+            self.tab_indicators.append(indicator)
 
             frame = tab_class(self.content, self)
             self.tab_frames.append(frame)
 
-        # Tab indicator line
-        sep2 = tk.Frame(self.root, bg=COLORS['border'], height=1)
-        sep2.pack(fill='x')
-        # Re-pack content after separator
-        self.content.pack_forget()
+        tk.Frame(self.root, bg=COLORS['border'], height=1).pack(fill='x')
         self.content.pack(fill='both', expand=True)
 
         self._switch_tab(0)
 
     def _switch_tab(self, idx):
         self.current_tab = idx
-        for i, (btn, frame) in enumerate(zip(self.tab_buttons, self.tab_frames)):
+        for i, (btn, indicator, frame) in enumerate(zip(
+                self.tab_buttons, self.tab_indicators, self.tab_frames)):
             if i == idx:
                 btn.config(fg=COLORS['tab_active'], bg=COLORS['bg'])
+                btn.master.config(bg=COLORS['bg'])
+                indicator.config(bg=COLORS['tab_active'])
                 frame.pack(fill='both', expand=True)
             else:
                 btn.config(fg=COLORS['tab_inactive'], bg=COLORS['bg_secondary'])
+                btn.master.config(bg=COLORS['bg_secondary'])
+                indicator.config(bg=COLORS['bg_secondary'])
                 frame.pack_forget()
 
     def run(self):
